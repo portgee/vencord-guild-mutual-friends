@@ -13,6 +13,8 @@ The plugin safely queries Discord’s profile APIs, caches results locally, and 
 - **Context menu integration** — launch directly from the guild right-click menu
 ---
 
+(This is my first plugin so sorry if its bad qwq)
+
 ## DOWNLOAD INSTRUCTIONS
 
 You can either **git clone** the repository or **manually install** it by downloading a ZIP.
