@@ -107,7 +107,6 @@ function getGuildNameFromProps(props: any): string | undefined {
 }
 
 const mutualCache = new Map<string, Map<string, MutualFriend[]>>();
-
 const mutualMeta = new Map<string, Map<string, number>>();
 
 function getCache(guildId: string): Map<string, MutualFriend[]> {
@@ -343,39 +342,65 @@ class GlobalRateLimiter {
     }
 }
 
+/**
+ * CHANGE #1 (required):
+ * - Treat Discord's "Unknown User" (code 10013 / status 404) as a normal skip and return []
+ * - Works whether RestAPI.get returns { ok:false, status:404, body:{code:10013} } OR throws that object
+ */
 async function fetchMutualFriends(userId: string): Promise<MutualFriend[]> {
     if (!userId) return [];
 
-    const res = await RestAPI.get({
-        url: `/users/${userId}/profile`,
-        query: {
-            with_mutual_friends: true,
-            with_mutual_guilds: false
-        },
-        retries: 0
-    });
+    try {
+        const res = await RestAPI.get({
+            url: `/users/${userId}/profile`,
+            query: {
+                with_mutual_friends: true,
+                with_mutual_guilds: false
+            },
+            retries: 0
+        });
 
-    const body = res?.body;
+        // Some implementations return ok/status rather than throwing
+        const ok = (res as any)?.ok;
+        const status = (res as any)?.status;
+        const code = (res as any)?.body?.code;
 
-    const mutuals =
-        body?.mutual_friends ??
-        body?.user_profile?.mutual_friends ??
-        body?.mutualFriends ??
-        [];
+        if (ok === false || status === 404 || code === 10013) {
+            return [];
+        }
 
-    const count =
-        body?.mutual_friends_count ??
-        body?.user_profile?.mutual_friends_count ??
-        body?.mutualFriendsCount;
+        const body = (res as any)?.body;
 
-    if ((!Array.isArray(mutuals) || mutuals.length === 0) && typeof count === "number" && count > 0) {
-        return [{
-            id: "count-only",
-            username: `(Mutuals exist, but Discord returned count only: ${count})`
-        }];
+        const mutuals =
+            body?.mutual_friends ??
+            body?.user_profile?.mutual_friends ??
+            body?.mutualFriends ??
+            [];
+
+        const count =
+            body?.mutual_friends_count ??
+            body?.user_profile?.mutual_friends_count ??
+            body?.mutualFriendsCount;
+
+        if ((!Array.isArray(mutuals) || mutuals.length === 0) && typeof count === "number" && count > 0) {
+            return [{
+                id: "count-only",
+                username: `(Mutuals exist, but Discord returned count only: ${count})`
+            }];
+        }
+
+        return Array.isArray(mutuals) ? mutuals : [];
+    } catch (e: any) {
+        const status = e?.status ?? e?.response?.status ?? e?.res?.status;
+        const code =
+            e?.body?.code ??
+            e?.response?.body?.code ??
+            e?.res?.body?.code;
+
+        if (status === 404 || code === 10013) return [];
+
+        throw e;
     }
-
-    return Array.isArray(mutuals) ? mutuals : [];
 }
 
 type Row = {
@@ -492,12 +517,12 @@ function isValidMutualArray(x: any): x is MutualFriend[] {
     return Array.isArray(x) && x.every(m => m && typeof m.id === "string");
 }
 
-function normalizePersistRoot(x: any): PersistRoot {
+function normalizePersistRoot(x: any) {
     if (!x || typeof x !== "object") {
-        return { v: PERSIST_VERSION, guilds: {} };
+        return { v: PERSIST_VERSION, guilds: {} } as PersistRoot;
     }
-    if (x.v !== PERSIST_VERSION || !x.guilds || typeof x.guilds !== "object") {
-        return { v: PERSIST_VERSION, guilds: {} };
+    if ((x as any).v !== PERSIST_VERSION || !(x as any).guilds || typeof (x as any).guilds !== "object") {
+        return { v: PERSIST_VERSION, guilds: {} } as PersistRoot;
     }
     return x as PersistRoot;
 }
@@ -772,7 +797,12 @@ const MutualFriendsModal = ErrorBoundary.wrap(
 
                         const ra = getRetryAfterMs(e);
                         const statusCode = e?.status ?? e?.response?.status ?? e?.res?.status;
+                        const code =
+                            e?.body?.code ??
+                            e?.response?.body?.code ??
+                            e?.res?.body?.code;
 
+                        // Rate limit handling (existing)
                         if (ra != null || statusCode === 429) {
                             const base = ra ?? 2000;
                             const jitter = 250 + Math.floor(Math.random() * 250);
@@ -786,6 +816,20 @@ const MutualFriendsModal = ErrorBoundary.wrap(
                             await updatePauseUiFromLimiter();
 
                             queue.unshift(id);
+                            continue;
+                        }
+
+                        /**
+                         * CHANGE #2 (optional, included):
+                         * - Do NOT hard-stop the entire scan on Unknown User (10013 / 404)
+                         * - Count it as completed and continue scanning
+                         */
+                        if (statusCode === 404 || code === 10013) {
+                            console.warn("[GuildMutualFriends] Skipping unknown user:", id, e);
+
+                            completed++;
+                            setDebugInfo(`Scanned ${completed}/${scanIds.length} • Found ${foundCount} with mutuals (skipped unknown user)`);
+                            setProgress(p => ({ ...p, done: Math.min(p.total, p.done + 1) }));
                             continue;
                         }
 
@@ -1077,7 +1121,6 @@ export default definePlugin({
 
     async start() {
         console.log("[GuildMutualFriends] Started");
-
         await loadPersistentIntoMemory();
     },
 
